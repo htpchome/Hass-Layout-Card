@@ -16,6 +16,10 @@ export class HassLayoutCard extends LitElement {
   @state() private _currentDateTime = new Date();
   private _dateTimeInterval?: ReturnType<typeof setInterval>;
   private _hass?: HomeAssistant;
+  private _resizeObserver?: ResizeObserver;
+  private _scrollHandler?: () => void;
+  private _visibilityHandler?: () => void;
+  private _lastKnownScrollY = 0;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
@@ -70,11 +74,133 @@ export class HassLayoutCard extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
     this._startDateTimeUpdate();
+    this._setupLayoutObservers();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopDateTimeUpdate();
+    this._teardownLayoutObservers();
+  }
+
+  /**
+   * Sets up observers to handle layout changes from iOS pull-to-refresh
+   * and other viewport shifts that can cause card positioning issues
+   */
+  private _setupLayoutObservers(): void {
+    // ResizeObserver to detect container size changes
+    this._resizeObserver = new ResizeObserver(() => {
+      this._handleLayoutShift();
+    });
+    
+    // Observe the parent container (the Lovelace view container)
+    const parentContainer = this._getLovelaceContainer();
+    if (parentContainer) {
+      this._resizeObserver.observe(parentContainer);
+    }
+    // Also observe self for size changes
+    this._resizeObserver.observe(this);
+
+    // Scroll handler to detect pull-to-refresh behavior
+    this._scrollHandler = () => {
+      const currentScrollY = window.scrollY || document.documentElement.scrollTop;
+      
+      // Detect potential pull-to-refresh: scroll goes negative or sudden jump
+      // This indicates iOS pull-to-refresh is active
+      if (currentScrollY < 0 || (this._lastKnownScrollY > 50 && currentScrollY < 10)) {
+        // Schedule a layout fix after refresh completes
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            this._handleLayoutShift();
+          }, 100);
+        });
+      }
+      
+      this._lastKnownScrollY = currentScrollY;
+    };
+    window.addEventListener('scroll', this._scrollHandler, { passive: true });
+
+    // Visibility change handler - recalculate when returning to view
+    this._visibilityHandler = () => {
+      if (!document.hidden) {
+        // Page became visible again - force layout recalculation
+        requestAnimationFrame(() => {
+          this._handleLayoutShift();
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+
+    // Store initial scroll position
+    this._lastKnownScrollY = window.scrollY || document.documentElement.scrollTop;
+  }
+
+  /**
+   * Tears down all observers and event listeners
+   */
+  private _teardownLayoutObservers(): void {
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = undefined;
+    }
+
+    if (this._scrollHandler) {
+      window.removeEventListener('scroll', this._scrollHandler);
+      this._scrollHandler = undefined;
+    }
+
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler);
+      this._visibilityHandler = undefined;
+    }
+  }
+
+  /**
+   * Gets the Lovelace view container element
+   */
+  private _getLovelaceContainer(): HTMLElement | null {
+    // Walk up the DOM to find the Lovelace container
+    let element: HTMLElement | null = this.parentElement;
+    while (element) {
+      // Look for common HA container selectors
+      if (
+        element.classList.contains('column') ||
+        element.id === 'columns' ||
+        element.tagName.toLowerCase() === 'hui-view' ||
+        element.tagName.toLowerCase() === 'hui-panel-view'
+      ) {
+        return element;
+      }
+      element = element.parentElement;
+    }
+    return null;
+  }
+
+  /**
+   * Handles layout shifts by forcing a re-render and position recalculation
+   * This is the key fix for iOS pull-to-refresh positioning issues
+   */
+  private _handleLayoutShift(): void {
+    // Force the browser to recalculate layout
+    // Reading offsetHeight forces a synchronous layout
+    void this.offsetHeight;
+    
+    // Request a re-render of the component
+    this.requestUpdate();
+    
+    // Use double requestAnimationFrame to ensure layout is fully recalculated
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        // Force another layout calculation
+        void this.getBoundingClientRect();
+        
+        // Dispatch a custom event that other cards can listen to
+        this.dispatchEvent(new CustomEvent('layout-shift-handled', {
+          bubbles: true,
+          composed: true,
+        }));
+      });
+    });
   }
 
   private _startDateTimeUpdate(): void {
