@@ -16,11 +16,10 @@ export class HassLayoutCard extends LitElement {
   @state() private _currentDateTime = new Date();
   private _dateTimeInterval?: ReturnType<typeof setInterval>;
   private _hass?: HomeAssistant;
-  private _touchStartY = 0;
-  private _touchActive = false;
-  private _recoveryTimer?: ReturnType<typeof setTimeout>;
-  private _resizeHandler?: () => void;
-  private _lastInnerHeight = 0;
+  private _animationFrameId?: number;
+  private _lastHeaderY = 0;
+  private _headerPushedDown = false;
+  private _recoveryAttempts = 0;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
@@ -56,188 +55,160 @@ export class HassLayoutCard extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
     this._startDateTimeUpdate();
-    this._setupViewportFix();
+    this._startHeaderMonitor();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopDateTimeUpdate();
-    this._teardownViewportFix();
+    this._stopHeaderMonitor();
   }
 
   /**
-   * iOS pull-to-refresh fix for HA Sections view.
+   * Monitors the HA header position to detect iOS pull-to-refresh spinner.
    * 
-   * In WKWebView, pull-to-refresh does NOT scroll the page - it physically
-   * shifts the WebView viewport down, changing window.innerHeight.
-   * 
-   * 1. User pulls down -> native spinner appears -> viewport shrinks
-   * 2. Cards calculate positions with reduced innerHeight 
-   * 3. Spinner disappears -> viewport expands back -> header moves up
-   * 4. Cards retain stale positions from step 2 -> empty space above cards
-   * 
-   * Fix: Monitor window.innerHeight for changes and force HA's layout engine
-   * to recalculate via resize events and DOM manipulation.
+   * When the iOS WKWebView pull-to-refresh spinner appears, it pushes the
+   * entire WebView down, including the HA header. When the spinner disappears,
+   * the header moves back up. We detect both transitions:
+   *   - Header moves down => spinner appeared (mark state, cards about to misrender)
+   *   - Header moves back up => spinner gone (trigger fix)
    */
-  private _setupViewportFix(): void {
-    this._lastInnerHeight = window.innerHeight;
+  private _startHeaderMonitor(): void {
+    // Initialize baseline - get current header Y position
+    this._lastHeaderY = this._getHeaderY();
 
-    // Watch for viewport height changes (pull-to-refresh causes these)
-    this._resizeHandler = () => {
-      const currentHeight = window.innerHeight;
-      
-      // Height changed by more than a few px = viewport shift
-      if (Math.abs(currentHeight - this._lastInnerHeight) > 10) {
-        this._lastInnerHeight = currentHeight;
-        // Schedule recalculation after viewport stabilizes
-        this._scheduleRecoveryAfterViewportChange();
-      }
-    };
-    window.addEventListener('resize', this._resizeHandler);
+    const check = () => {
+      const currentY = this._getHeaderY();
+      const delta = currentY - this._lastHeaderY;
 
-    // Touch gesture detection as backup trigger
-    const touchStart = (e: TouchEvent) => {
-      if (e.touches.length === 1) {
-        this._touchStartY = e.touches[0].clientY;
-        this._touchActive = true;
+      // Header pushed down significantly => spinner just appeared
+      if (delta > 10 && !this._headerPushedDown) {
+        this._headerPushedDown = true;
       }
-    };
 
-    const touchEnd = (e: TouchEvent) => {
-      if (!this._touchActive) return;
-      this._touchActive = false;
-      const dy = e.changedTouches[0].clientY - this._touchStartY;
-      
-      // Pull-down > 40px at top of page
-      if (dy > 40 && window.scrollY <= 0) {
-        this._scheduleRecoveryAfterViewportChange(1500);
+      // Header moved back up after being pushed down => spinner gone
+      if (delta < -5 && this._headerPushedDown) {
+        this._headerPushedDown = false;
+        this._recoveryAttempts = 0;
+        // Give the layout a moment to settle, then fix
+        setTimeout(() => this._recoverCardPosition(), 50);
       }
+
+      this._lastHeaderY = currentY;
+      this._animationFrameId = requestAnimationFrame(check);
     };
 
-    window.addEventListener('touchstart', touchStart, { passive: true });
-    window.addEventListener('touchend', touchEnd, { passive: true });
-
-    this._teardownViewportFix = () => {
-      window.removeEventListener('resize', this._resizeHandler!);
-      window.removeEventListener('touchstart', touchStart);
-      window.removeEventListener('touchend', touchEnd);
-      if (this._recoveryTimer) {
-        clearTimeout(this._recoveryTimer);
-      }
-    };
+    this._animationFrameId = requestAnimationFrame(check);
   }
 
-  /**
-   * Schedule staggered recovery attempts after viewport change.
-   * We use multiple delays because we don't know exactly when the
-   * iOS spinner animation will complete.
-   */
-  private _scheduleRecoveryAfterViewportChange(delay = 800): void {
-    if (this._recoveryTimer) {
-      clearTimeout(this._recoveryTimer);
+  private _stopHeaderMonitor(): void {
+    if (this._animationFrameId) {
+      cancelAnimationFrame(this._animationFrameId);
+      this._animationFrameId = undefined;
     }
-    
-    this._recoveryTimer = setTimeout(() => this._forceGlobalRelayout(), delay);
-    setTimeout(() => this._forceGlobalRelayout(), delay + 300);
-    setTimeout(() => this._forceGlobalRelayout(), delay + 600);
   }
 
   /**
-   * Forces HA's entire layout engine to recalculate.
-   * 
-   * Since we can't directly access the shadow-DOM-enclosed sections view,
-   * we use several indirect methods to trigger a full layout recalculation:
-   * 
-   * 1. Dispatch 'resize' - HA listens for window resize events
-   * 2. Toggle html style to force reflow on the entire document
-   * 3. Access internals via any reachable HA API
-   * 4. Force this card to re-render
+   * Gets the current Y position of the HA header element.
+   * Tries multiple methods to locate the HA top bar / app-header.
    */
-  private _forceGlobalRelayout(): void {
-    // Method 1: Dispatch resize event - HA listens for these
+  private _getHeaderY(): number {
+    // Strategy 1: ha-menu-button (the hamburger) is always in the header
+    const menuBtn = document.querySelector('ha-menu-button');
+    if (menuBtn) return menuBtn.getBoundingClientRect().top;
+
+    // Strategy 2: app-header or app-toolbar
+    let header = document.querySelector('app-header, app-toolbar');
+    if (header) return header.getBoundingClientRect().top;
+
+    // Strategy 3: Shadow DOM of home-assistant
+    const haEl = document.querySelector('home-assistant') as HTMLElement | null;
+    if (haEl?.shadowRoot) {
+      // Try direct query
+      header = haEl.shadowRoot.querySelector('app-header, app-toolbar, ha-menu-button, ha-app-layout [slot="app-header"]');
+      if (header) return header.getBoundingClientRect().top;
+
+      // Walk all elements with shadow roots
+      const allEls = haEl.shadowRoot.querySelectorAll('*');
+      for (const el of allEls) {
+        const htmlEl = el as HTMLElement;
+        if (htmlEl.shadowRoot) {
+          header = htmlEl.shadowRoot.querySelector('app-header, app-toolbar, ha-menu-button');
+          if (header) return header.getBoundingClientRect().top;
+        }
+      }
+    }
+
+    // Strategy 4: Any fixed/positioned element at the top
+    const topElements = document.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]');
+    for (const el of topElements) {
+      const rect = (el as HTMLElement).getBoundingClientRect();
+      if (rect.top >= 0 && rect.top < 60 && rect.height > 20) {
+        return rect.top;
+      }
+    }
+
+    // Strategy 5: VisualViewport offset - when iOS pushes content down,
+    // the visualViewport offsetTop changes
+    if (window.visualViewport) {
+      return window.visualViewport.offsetTop;
+    }
+
+    return 0;
+  }
+
+  /**
+   * Recovers card position after the iOS refresh spinner disappears.
+   * 
+   * The sections view grid calculated card positions while the header was
+   * pushed down. Now that the header is back up, we need to force the
+   * grid to recalculate with the correct header position.
+   */
+  private _recoverCardPosition(): void {
+    // Method 1: Force a global resize - HA sections view recalculates on resize
     window.dispatchEvent(new Event('resize'));
 
-    // Method 2: Force reflow at the document level by toggling a layout property
-    // This forces the browser to recalculate CSS Grid for all elements
-    const html = document.documentElement;
-    const origOverflow = html.style.overflow || getComputedStyle(html).overflow;
-    html.style.overflow = 'hidden';
-    void html.offsetHeight;
-    html.style.overflow = origOverflow;
+    // Method 2: Force the entire document to reflow
+    // This makes the browser recalculate all CSS Grid positions
+    const htmlEl = document.documentElement;
+    const origDisplay = htmlEl.style.display;
+    htmlEl.style.display = 'none';
+    void htmlEl.offsetHeight;     // Force sync reflow
+    htmlEl.style.display = origDisplay;
+    void htmlEl.offsetHeight;     // Force another reflow after restore
 
-    // Method 3: Try to access HA internals via the global customCards registry
-    // and any reachable API on the home-assistant element
-    const haEl = document.querySelector('home-assistant') as HTMLElement | null;
-    if (haEl) {
-      // Force reflow on the home-assistant element
-      void haEl.offsetHeight;
-      void haEl.getBoundingClientRect();
-
-      // Try to call any resize/layout method exposed on the element
-      if (typeof (haEl as any).notifyResize === 'function') {
-        (haEl as any).notifyResize();
-      }
-      
-      // Dispatch resize event into the shadow DOM
-      if (haEl.shadowRoot) {
-        haEl.shadowRoot.dispatchEvent(new Event('resize', { bubbles: true, composed: true }));
-      }
-    }
-
-    // Method 4: Force reflow and re-render of this card
+    // Method 3: Force this card to re-render
     void this.offsetHeight;
     void this.getBoundingClientRect();
     this.requestUpdate();
 
-    // Method 5: Additional animations to force visual update
+    // Method 4: Staggered resize events to catch async layout
     requestAnimationFrame(() => {
       window.dispatchEvent(new Event('resize'));
       
       requestAnimationFrame(() => {
         void this.offsetHeight;
+        void this.getBoundingClientRect();
         this.requestUpdate();
       });
     });
 
-    // Method 6: Try to access sections view through shadow DOM traversal
-    // Even though it's in shadow DOM, we can traverse into it
-    this._traverseShadowAndTriggerResize(document.body);
-  }
-
-  /**
-   * Recursively traverses shadow DOM and dispatches resize events
-   * to ensure all components get the notification
-   */
-  private _traverseShadowAndTriggerResize(root: HTMLElement | ShadowRoot): void {
-    // Dispatch resize to this root
-    root.dispatchEvent(new Event('resize', { bubbles: true, composed: true }));
-
-    // Force reflow on any matching custom elements
-    const allElements = root.querySelectorAll('*');
-    for (const el of allElements) {
-      const htmlEl = el as HTMLElement;
-      const tagName = htmlEl.tagName.toLowerCase();
-      // Force reflow on sections view and related elements
-      if (
-        tagName === 'hui-sections-view' ||
-        tagName === 'hui-view' ||
-        tagName === 'hui-root-view' ||
-        tagName === 'ha-panel-lovelace'
-      ) {
-        void htmlEl.offsetHeight;
-        void htmlEl.getBoundingClientRect();
-
-        // Notify any custom element API
-        if (typeof (htmlEl as any).notifyResize === 'function') {
-          (htmlEl as any).notifyResize();
+    // Method 5: Retry up to 3 times if header still misaligned
+    setTimeout(() => {
+      if (this._recoveryAttempts < 3) {
+        this._recoveryAttempts++;
+        // Check if fix actually worked by comparing header and card positions
+        const headerY = this._getHeaderY();
+        // Approximate header height is 56px (--header-height)
+        const expectedCardTop = headerY + 56;
+        const cardRect = this.getBoundingClientRect();
+        
+        // If card is more than 20px below expected position, retry
+        if (cardRect.top > expectedCardTop + 20) {
+          this._recoverCardPosition();
         }
       }
-
-      // Recurse into shadow roots
-      if (htmlEl.shadowRoot) {
-        this._traverseShadowAndTriggerResize(htmlEl.shadowRoot);
-      }
-    }
+    }, 100);
   }
 
   private _startDateTimeUpdate(): void {
@@ -251,12 +222,6 @@ export class HassLayoutCard extends LitElement {
     if (this._dateTimeInterval) {
       clearInterval(this._dateTimeInterval);
       this._dateTimeInterval = undefined;
-    }
-  }
-
-  private _teardownViewportFix(): void {
-    if (this._recoveryTimer) {
-      clearTimeout(this._recoveryTimer);
     }
   }
 
