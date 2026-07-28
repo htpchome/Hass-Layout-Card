@@ -21,6 +21,7 @@ export class HassLayoutCard extends LitElement {
   private _touchActive = false;
   private _wasAtTop = false;
   private _recoveryTimer?: ReturnType<typeof setTimeout>;
+  private _resizeObserver?: ResizeObserver;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
@@ -57,14 +58,29 @@ export class HassLayoutCard extends LitElement {
     super.connectedCallback();
     this._startDateTimeUpdate();
     this._setupScrollFix();
+    this._setupResizeObserver();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopDateTimeUpdate();
     this._teardownScrollFix();
+    this._teardownResizeObserver();
   }
 
+  /**
+   * iOS pull-to-refresh fix:
+   * 
+   * When pull-to-refresh happens on iOS companion app, the WKWebView's
+   * viewport temporarily shifts as the native spinner appears at the top.
+   * Home Assistant's sections view (CSS Grid layout) calculates card positions
+   * during this shift. After the spinner disappears and the viewport returns to
+   * normal, the sections view retains stale position calculations, leaving
+   * empty space between the header and cards.
+   * 
+   * The fix: Detect when pull-to-refresh completes and force the sections
+   * view to recalculate its grid layout.
+   */
   private _setupScrollFix(): void {
     this._scrollHandler = () => {
       const scrollY = window.scrollY || document.documentElement.scrollTop;
@@ -73,13 +89,15 @@ export class HassLayoutCard extends LitElement {
         this._wasAtTop = true;
       }
       
+      // Scroll returned to zero after being pulled - refresh completed
       if (scrollY === 0 && this._wasAtTop) {
         this._wasAtTop = false;
-        this._scheduleLayoutRecovery();
+        this._scheduleSectionsRecalculate();
       }
     };
     window.addEventListener('scroll', this._scrollHandler, { passive: true });
 
+    // Touch gesture detection for pull-to-refresh
     const touchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
         this._touchStartY = e.touches[0].clientY;
@@ -93,8 +111,10 @@ export class HassLayoutCard extends LitElement {
       const dy = e.changedTouches[0].clientY - this._touchStartY;
       const scrollY = window.scrollY || document.documentElement.scrollTop;
       
+      // Pull-down gesture at top of page = likely refresh
       if (dy > 40 && scrollY <= 0) {
-        this._scheduleLayoutRecovery(1500);
+        // Wait for refresh spinner to finish, then recalculate
+        this._scheduleSectionsRecalculate(1500);
       }
     };
 
@@ -111,105 +131,131 @@ export class HassLayoutCard extends LitElement {
     };
   }
 
-  private _scheduleLayoutRecovery(delay = 500): void {
+  /**
+   * Sets up a ResizeObserver on the sections view to detect layout changes
+   */
+  private _setupResizeObserver(): void {
+    const sectionsView = this._findSectionsView();
+    if (!sectionsView) return;
+
+    this._resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        // Any height change in the sections view that's more than 1px
+        // could indicate the header shifted and the grid needs recalculation
+        if (Math.abs(entry.contentRect.height - (entry.target as HTMLElement).offsetHeight) > 1) {
+          this._triggerSectionsRecalculate();
+        }
+      }
+    });
+
+    this._resizeObserver.observe(sectionsView);
+  }
+
+  private _teardownResizeObserver(): void {
+    if (this._resizeObserver) {
+      this._resizeObserver.disconnect();
+      this._resizeObserver = undefined;
+    }
+  }
+
+  /**
+   * Schedule staggered recalculation attempts to catch the right timing
+   * after the iOS refresh spinner disappears
+   */
+  private _scheduleSectionsRecalculate(delay = 500): void {
     if (this._recoveryTimer) {
       clearTimeout(this._recoveryTimer);
     }
     
-    this._recoveryTimer = setTimeout(() => this._fixCardTransforms(), delay);
-    setTimeout(() => this._fixCardTransforms(), delay + 300);
-    setTimeout(() => this._fixCardTransforms(), delay + 600);
+    // Multiple attempts at different delays to catch the header repositioning
+    this._recoveryTimer = setTimeout(() => this._triggerSectionsRecalculate(), delay);
+    setTimeout(() => this._triggerSectionsRecalculate(), delay + 300);
+    setTimeout(() => this._triggerSectionsRecalculate(), delay + 600);
   }
 
   /**
-   * Fixes stale CSS transforms on Lovelace cards caused by iOS pull-to-refresh.
+   * Forces the sections view to recalculate its CSS Grid layout.
    * 
-   * Lovelace uses transform: translate(x, y) on card containers to position
-   * them in the masonry layout. After iOS pull-to-refresh pushes content down
-   * and then back up, these transforms are stale and cause empty space above
-   * the cards. We fix this by temporarily clearing all transforms, which
-   * triggers the masonry layout to recalculate correct positions.
+   * In sections view, cards are positioned using CSS Grid. The grid shouldn't
+   * need explicit recalculation since it's flow-based (auto-placement). But
+   * if the viewport shifts during iOS refresh and section sizing is cached,
+   * we need to force a recalculation.
    */
-  private _fixCardTransforms(): void {
-    const masonryView = this._findMasonryView();
-    if (!masonryView) return;
-
-    // Find all elements with transform:translate that are card containers
-    // These are typically divs inside the masonry view
-    const allElements = masonryView.querySelectorAll<HTMLElement>('*');
-    const transformedElements: Array<{ el: HTMLElement; transform: string }> = [];
+  private _triggerSectionsRecalculate(): void {
+    const sectionsView = this._findSectionsView();
     
-    for (const el of allElements) {
-      const transform = el.style.transform;
-      if (transform && transform.includes('translate')) {
-        transformedElements.push({ el, transform });
-      }
-    }
-
-    if (transformedElements.length === 0) {
-      // No transforms to fix, try resize event instead
-      this._triggerResize();
-      return;
-    }
-
-    // Step 1: Save and clear all transforms simultaneously
-    for (const { el } of transformedElements) {
-      el.style.transform = '';
-    }
-
-    // Step 2: Force a synchronous reflow so browser sees elements without transforms
-    void masonryView.offsetHeight;
-
-    // Step 3: Restore transforms on next frame so masonry layout recalculates them
-    requestAnimationFrame(() => {
-      for (const { el, transform } of transformedElements) {
-        el.style.transform = transform;
+    if (sectionsView) {
+      // Force the sections view to remeasure and relayout by toggling
+      // a CSS property that affects grid behavior
+      const originalGap = sectionsView.style.gap || 
+                          getComputedStyle(sectionsView).gap;
+      
+      if (originalGap) {
+        // Toggle grid gap to force grid recalculation
+        const gapValue = parseFloat(originalGap);
+        sectionsView.style.gap = (gapValue + 0.1) + 'px';
+        void sectionsView.offsetHeight; // Force sync reflow
+        sectionsView.style.gap = originalGap;
+      } else {
+        // Fallback: toggle visibility to force reflow
+        const originalVisibility = sectionsView.style.visibility;
+        sectionsView.style.visibility = 'hidden';
+        void sectionsView.offsetHeight;
+        sectionsView.style.visibility = originalVisibility;
       }
 
-      // Step 4: After restore, trigger another reflow and resize event
-      requestAnimationFrame(() => {
-        void masonryView.offsetHeight;
-        this._triggerResize();
-      });
-    });
-  }
+      // Force reflow again after restore
+      void sectionsView.offsetHeight;
+      void sectionsView.getBoundingClientRect();
+    }
 
-  /**
-   * Triggers resize events to force Lovelace to recalculate layout
-   */
-  private _triggerResize(): void {
+    // Dispatch resize - HA's frontend listens for this
     window.dispatchEvent(new Event('resize'));
-    
-    // Also force re-render of this card
+
+    // Force re-render of this card
     void this.offsetHeight;
     void this.getBoundingClientRect();
     this.requestUpdate();
+
+    // Additional resize after a short delay for any async layout
+    setTimeout(() => {
+      window.dispatchEvent(new Event('resize'));
+      void this.offsetHeight;
+      this.requestUpdate();
+    }, 100);
   }
 
   /**
-   * Finds the masonry/grid view element that manages card layout
+   * Finds the sections view element (hui-sections-view)
    */
-  private _findMasonryView(): HTMLElement | null {
-    const selectors = [
-      'hui-masonry-view',
-      'hui-panel-view',
-      'hui-view',
-      'hui-sections-view',
-    ];
-    
-    for (const selector of selectors) {
-      const el = document.querySelector(selector);
-      if (el) return el as HTMLElement;
-    }
-    
+  private _findSectionsView(): HTMLElement | null {
+    // Direct selector for sections view
+    let el: HTMLElement | null = document.querySelector('hui-sections-view');
+    if (el) return el;
+
+    // Try shadow DOM of home-assistant
     const haEl = document.querySelector('home-assistant');
     if (haEl?.shadowRoot) {
-      for (const selector of selectors) {
-        const el = haEl.shadowRoot.querySelector(selector);
-        if (el) return el as HTMLElement;
+      el = haEl.shadowRoot.querySelector('hui-sections-view');
+      if (el) return el;
+
+      // Dig deeper into nested shadow DOM
+      const allElements = haEl.shadowRoot.querySelectorAll('*');
+      for (const element of allElements) {
+        if ((element as HTMLElement).shadowRoot) {
+          el = (element as HTMLElement).shadowRoot!.querySelector('hui-sections-view');
+          if (el) return el;
+        }
       }
     }
+
+    // Fallback: try panel or view
+    el = document.querySelector('hui-panel-view');
+    if (el) return el;
     
+    el = document.querySelector('hui-view');
+    if (el) return el;
+
     return null;
   }
 
