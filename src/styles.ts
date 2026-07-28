@@ -90,6 +90,15 @@ export const cardStyles = css`
     font-size: 0.875rem;
     color: var(--secondary-text-color, #727272);
     background: var(--secondary-background-color, #f5f5f5);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .card-version {
+    font-size: 0.75rem;
+    opacity: 0.7;
+    font-style: italic;
   }
 
   /* Editor Styles */

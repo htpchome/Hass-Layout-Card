@@ -264,7 +264,8 @@ export class HassLayoutCard extends LitElement {
   private _renderFooter(): TemplateResult {
     return html`
       <div class="card-footer">
-        Footer
+        <span>Footer</span>
+        <span class="card-version">v${CARD_VERSION}</span>
       </div>
     `;
   }
