@@ -17,9 +17,16 @@ export class HassLayoutCard extends LitElement {
   private _dateTimeInterval?: ReturnType<typeof setInterval>;
   private _hass?: HomeAssistant;
   private _resizeObserver?: ResizeObserver;
+  private _mutationObserver?: MutationObserver;
   private _scrollHandler?: () => void;
   private _visibilityHandler?: () => void;
+  private _touchStartHandler?: (e: TouchEvent) => void;
+  private _touchEndHandler?: (e: TouchEvent) => void;
   private _lastKnownScrollY = 0;
+  private _lastHeaderTop = 0;
+  private _headerCheckInterval?: ReturnType<typeof setInterval>;
+  private _isPulling = false;
+  private _pullStartY = 0;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
@@ -101,29 +108,47 @@ export class HassLayoutCard extends LitElement {
     // Also observe self for size changes
     this._resizeObserver.observe(this);
 
+    // Set up MutationObserver to watch the HA header for position changes
+    this._setupHeaderObserver();
+
     // Scroll handler to detect pull-to-refresh behavior
     this._scrollHandler = () => {
       const currentScrollY = window.scrollY || document.documentElement.scrollTop;
       
       // Detect potential pull-to-refresh: scroll goes negative or sudden jump
-      // This indicates iOS pull-to-refresh is active
       if (currentScrollY < 0 || (this._lastKnownScrollY > 50 && currentScrollY < 10)) {
-        // Schedule a layout fix after refresh completes
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            this._handleLayoutShift();
-          }, 100);
-        });
+        this._startHeaderPolling();
       }
       
       this._lastKnownScrollY = currentScrollY;
     };
     window.addEventListener('scroll', this._scrollHandler, { passive: true });
 
+    // Touch handlers to detect pull-to-refresh gesture
+    this._touchStartHandler = (e: TouchEvent) => {
+      if (e.touches.length === 1) {
+        this._pullStartY = e.touches[0].clientY;
+        this._isPulling = true;
+      }
+    };
+    
+    this._touchEndHandler = (e: TouchEvent) => {
+      if (this._isPulling) {
+        const pullDistance = e.changedTouches[0].clientY - this._pullStartY;
+        // If pulled down more than 60px, likely a refresh gesture
+        if (pullDistance > 60 && window.scrollY <= 0) {
+          this._startHeaderPolling();
+        }
+        this._isPulling = false;
+      }
+    };
+    
+    window.addEventListener('touchstart', this._touchStartHandler, { passive: true });
+    window.addEventListener('touchend', this._touchEndHandler, { passive: true });
+
     // Visibility change handler - recalculate when returning to view
     this._visibilityHandler = () => {
       if (!document.hidden) {
-        // Page became visible again - force layout recalculation
         requestAnimationFrame(() => {
           this._handleLayoutShift();
         });
@@ -131,22 +156,171 @@ export class HassLayoutCard extends LitElement {
     };
     document.addEventListener('visibilitychange', this._visibilityHandler);
 
-    // Store initial scroll position
+    // Store initial positions
     this._lastKnownScrollY = window.scrollY || document.documentElement.scrollTop;
+    this._lastHeaderTop = this._getHeaderTop();
+  }
+
+  /**
+   * Sets up MutationObserver to watch the HA header element for changes
+   */
+  private _setupHeaderObserver(): void {
+    const header = this._getHAHeader();
+    if (!header) {
+      // Retry after a short delay if header not found yet
+      setTimeout(() => this._setupHeaderObserver(), 500);
+      return;
+    }
+
+    this._mutationObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        if (mutation.type === 'attributes') {
+          const currentHeaderTop = this._getHeaderTop();
+          // If header position changed significantly, handle the shift
+          if (Math.abs(currentHeaderTop - this._lastHeaderTop) > 5) {
+            this._lastHeaderTop = currentHeaderTop;
+            this._handleLayoutShift();
+          }
+        }
+      }
+    });
+
+    // Watch for style and class changes on the header
+    this._mutationObserver.observe(header, {
+      attributes: true,
+      attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'],
+    });
+
+    // Also watch the header's parent for transform changes
+    const headerParent = header.parentElement;
+    if (headerParent) {
+      this._mutationObserver.observe(headerParent, {
+        attributes: true,
+        attributeFilter: ['style', 'class'],
+      });
+    }
+
+    this._lastHeaderTop = this._getHeaderTop();
+  }
+
+  /**
+   * Gets the Home Assistant header element
+   */
+  private _getHAHeader(): HTMLElement | null {
+    // Try various selectors for the HA header
+    const selectors = [
+      'app-header',
+      'ha-app-layout app-header',
+      '.header',
+      'app-toolbar',
+      'ha-menu-button',
+    ];
+    
+    // Search in the shadow DOM host or document
+    const root = this.getRootNode() as Document | ShadowRoot;
+    
+    for (const selector of selectors) {
+      const element = root.querySelector(selector) || document.querySelector(selector);
+      if (element) {
+        return element as HTMLElement;
+      }
+    }
+    
+    // Try to find via home-assistant element
+    const haMain = document.querySelector('home-assistant')?.shadowRoot?.querySelector('ha-panel-lovelace');
+    if (haMain) {
+      const header = haMain.shadowRoot?.querySelector('app-header') || 
+                     haMain.shadowRoot?.querySelector('hui-view')?.shadowRoot?.querySelector('app-header');
+      if (header) {
+        return header as HTMLElement;
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Gets the current top position of the HA header
+   */
+  private _getHeaderTop(): number {
+    const header = this._getHAHeader();
+    if (header) {
+      const rect = header.getBoundingClientRect();
+      return rect.top;
+    }
+    return 0;
+  }
+
+  /**
+   * Starts polling to detect when header returns to normal position after refresh
+   */
+  private _startHeaderPolling(): void {
+    if (this._headerCheckInterval) {
+      return; // Already polling
+    }
+
+    let pollCount = 0;
+    const maxPolls = 50; // Poll for ~2.5 seconds max
+
+    this._headerCheckInterval = setInterval(() => {
+      pollCount++;
+      const currentHeaderTop = this._getHeaderTop();
+      
+      // Check if header has moved back up (refresh completed)
+      if (Math.abs(currentHeaderTop - this._lastHeaderTop) > 5) {
+        this._lastHeaderTop = currentHeaderTop;
+        this._handleLayoutShift();
+      }
+
+      // Stop polling after max polls or if we've been stable for a while
+      if (pollCount >= maxPolls) {
+        this._stopHeaderPolling();
+      }
+    }, 50);
+
+    // Auto-stop after 3 seconds
+    setTimeout(() => this._stopHeaderPolling(), 3000);
+  }
+
+  /**
+   * Stops header position polling
+   */
+  private _stopHeaderPolling(): void {
+    if (this._headerCheckInterval) {
+      clearInterval(this._headerCheckInterval);
+      this._headerCheckInterval = undefined;
+    }
   }
 
   /**
    * Tears down all observers and event listeners
    */
   private _teardownLayoutObservers(): void {
+    this._stopHeaderPolling();
+
     if (this._resizeObserver) {
       this._resizeObserver.disconnect();
       this._resizeObserver = undefined;
     }
 
+    if (this._mutationObserver) {
+      this._mutationObserver.disconnect();
+      this._mutationObserver = undefined;
+    }
+
     if (this._scrollHandler) {
       window.removeEventListener('scroll', this._scrollHandler);
       this._scrollHandler = undefined;
+    }
+
+    if (this._touchStartHandler) {
+      window.removeEventListener('touchstart', this._touchStartHandler);
+      this._touchStartHandler = undefined;
+    }
+
+    if (this._touchEndHandler) {
+      window.removeEventListener('touchend', this._touchEndHandler);
+      this._touchEndHandler = undefined;
     }
 
     if (this._visibilityHandler) {
@@ -182,22 +356,37 @@ export class HassLayoutCard extends LitElement {
    */
   private _handleLayoutShift(): void {
     // Force the browser to recalculate layout
-    // Reading offsetHeight forces a synchronous layout
     void this.offsetHeight;
     
     // Request a re-render of the component
     this.requestUpdate();
     
-    // Use double requestAnimationFrame to ensure layout is fully recalculated
+    // Use multiple animation frames to ensure layout is fully recalculated
     requestAnimationFrame(() => {
+      // Force reflow by reading layout properties
+      void this.getBoundingClientRect();
+      
       requestAnimationFrame(() => {
         // Force another layout calculation
+        void this.offsetHeight;
         void this.getBoundingClientRect();
+        
+        // Try to scroll to ensure proper positioning
+        const cardRect = this.getBoundingClientRect();
+        const headerTop = this._getHeaderTop();
+        
+        // If card appears to be overlapping with header area, force adjustment
+        if (cardRect.top < headerTop + 50 && headerTop > 0) {
+          // Dispatch scroll event to trigger HA's layout recalculation
+          window.dispatchEvent(new Event('resize'));
+          window.dispatchEvent(new Event('scroll'));
+        }
         
         // Dispatch a custom event that other cards can listen to
         this.dispatchEvent(new CustomEvent('layout-shift-handled', {
           bubbles: true,
           composed: true,
+          detail: { headerTop, cardTop: cardRect.top }
         }));
       });
     });
