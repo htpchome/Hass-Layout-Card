@@ -16,12 +16,11 @@ export class HassLayoutCard extends LitElement {
   @state() private _currentDateTime = new Date();
   private _dateTimeInterval?: ReturnType<typeof setInterval>;
   private _hass?: HomeAssistant;
-  private _scrollHandler?: () => void;
   private _touchStartY = 0;
   private _touchActive = false;
-  private _wasAtTop = false;
   private _recoveryTimer?: ReturnType<typeof setTimeout>;
-  private _resizeObserver?: ResizeObserver;
+  private _resizeHandler?: () => void;
+  private _lastInnerHeight = 0;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
@@ -57,47 +56,46 @@ export class HassLayoutCard extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
     this._startDateTimeUpdate();
-    this._setupScrollFix();
-    this._setupResizeObserver();
+    this._setupViewportFix();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopDateTimeUpdate();
-    this._teardownScrollFix();
-    this._teardownResizeObserver();
+    this._teardownViewportFix();
   }
 
   /**
-   * iOS pull-to-refresh fix:
+   * iOS pull-to-refresh fix for HA Sections view.
    * 
-   * When pull-to-refresh happens on iOS companion app, the WKWebView's
-   * viewport temporarily shifts as the native spinner appears at the top.
-   * Home Assistant's sections view (CSS Grid layout) calculates card positions
-   * during this shift. After the spinner disappears and the viewport returns to
-   * normal, the sections view retains stale position calculations, leaving
-   * empty space between the header and cards.
+   * In WKWebView, pull-to-refresh does NOT scroll the page - it physically
+   * shifts the WebView viewport down, changing window.innerHeight.
    * 
-   * The fix: Detect when pull-to-refresh completes and force the sections
-   * view to recalculate its grid layout.
+   * 1. User pulls down -> native spinner appears -> viewport shrinks
+   * 2. Cards calculate positions with reduced innerHeight 
+   * 3. Spinner disappears -> viewport expands back -> header moves up
+   * 4. Cards retain stale positions from step 2 -> empty space above cards
+   * 
+   * Fix: Monitor window.innerHeight for changes and force HA's layout engine
+   * to recalculate via resize events and DOM manipulation.
    */
-  private _setupScrollFix(): void {
-    this._scrollHandler = () => {
-      const scrollY = window.scrollY || document.documentElement.scrollTop;
+  private _setupViewportFix(): void {
+    this._lastInnerHeight = window.innerHeight;
+
+    // Watch for viewport height changes (pull-to-refresh causes these)
+    this._resizeHandler = () => {
+      const currentHeight = window.innerHeight;
       
-      if (scrollY <= 0) {
-        this._wasAtTop = true;
-      }
-      
-      // Scroll returned to zero after being pulled - refresh completed
-      if (scrollY === 0 && this._wasAtTop) {
-        this._wasAtTop = false;
-        this._scheduleSectionsRecalculate();
+      // Height changed by more than a few px = viewport shift
+      if (Math.abs(currentHeight - this._lastInnerHeight) > 10) {
+        this._lastInnerHeight = currentHeight;
+        // Schedule recalculation after viewport stabilizes
+        this._scheduleRecoveryAfterViewportChange();
       }
     };
-    window.addEventListener('scroll', this._scrollHandler, { passive: true });
+    window.addEventListener('resize', this._resizeHandler);
 
-    // Touch gesture detection for pull-to-refresh
+    // Touch gesture detection as backup trigger
     const touchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
         this._touchStartY = e.touches[0].clientY;
@@ -109,20 +107,18 @@ export class HassLayoutCard extends LitElement {
       if (!this._touchActive) return;
       this._touchActive = false;
       const dy = e.changedTouches[0].clientY - this._touchStartY;
-      const scrollY = window.scrollY || document.documentElement.scrollTop;
       
-      // Pull-down gesture at top of page = likely refresh
-      if (dy > 40 && scrollY <= 0) {
-        // Wait for refresh spinner to finish, then recalculate
-        this._scheduleSectionsRecalculate(1500);
+      // Pull-down > 40px at top of page
+      if (dy > 40 && window.scrollY <= 0) {
+        this._scheduleRecoveryAfterViewportChange(1500);
       }
     };
 
     window.addEventListener('touchstart', touchStart, { passive: true });
     window.addEventListener('touchend', touchEnd, { passive: true });
 
-    this._teardownScrollFix = () => {
-      window.removeEventListener('scroll', this._scrollHandler!);
+    this._teardownViewportFix = () => {
+      window.removeEventListener('resize', this._resizeHandler!);
       window.removeEventListener('touchstart', touchStart);
       window.removeEventListener('touchend', touchEnd);
       if (this._recoveryTimer) {
@@ -132,131 +128,116 @@ export class HassLayoutCard extends LitElement {
   }
 
   /**
-   * Sets up a ResizeObserver on the sections view to detect layout changes
+   * Schedule staggered recovery attempts after viewport change.
+   * We use multiple delays because we don't know exactly when the
+   * iOS spinner animation will complete.
    */
-  private _setupResizeObserver(): void {
-    const sectionsView = this._findSectionsView();
-    if (!sectionsView) return;
-
-    this._resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        // Any height change in the sections view that's more than 1px
-        // could indicate the header shifted and the grid needs recalculation
-        if (Math.abs(entry.contentRect.height - (entry.target as HTMLElement).offsetHeight) > 1) {
-          this._triggerSectionsRecalculate();
-        }
-      }
-    });
-
-    this._resizeObserver.observe(sectionsView);
-  }
-
-  private _teardownResizeObserver(): void {
-    if (this._resizeObserver) {
-      this._resizeObserver.disconnect();
-      this._resizeObserver = undefined;
-    }
-  }
-
-  /**
-   * Schedule staggered recalculation attempts to catch the right timing
-   * after the iOS refresh spinner disappears
-   */
-  private _scheduleSectionsRecalculate(delay = 500): void {
+  private _scheduleRecoveryAfterViewportChange(delay = 800): void {
     if (this._recoveryTimer) {
       clearTimeout(this._recoveryTimer);
     }
     
-    // Multiple attempts at different delays to catch the header repositioning
-    this._recoveryTimer = setTimeout(() => this._triggerSectionsRecalculate(), delay);
-    setTimeout(() => this._triggerSectionsRecalculate(), delay + 300);
-    setTimeout(() => this._triggerSectionsRecalculate(), delay + 600);
+    this._recoveryTimer = setTimeout(() => this._forceGlobalRelayout(), delay);
+    setTimeout(() => this._forceGlobalRelayout(), delay + 300);
+    setTimeout(() => this._forceGlobalRelayout(), delay + 600);
   }
 
   /**
-   * Forces the sections view to recalculate its CSS Grid layout.
+   * Forces HA's entire layout engine to recalculate.
    * 
-   * In sections view, cards are positioned using CSS Grid. The grid shouldn't
-   * need explicit recalculation since it's flow-based (auto-placement). But
-   * if the viewport shifts during iOS refresh and section sizing is cached,
-   * we need to force a recalculation.
+   * Since we can't directly access the shadow-DOM-enclosed sections view,
+   * we use several indirect methods to trigger a full layout recalculation:
+   * 
+   * 1. Dispatch 'resize' - HA listens for window resize events
+   * 2. Toggle html style to force reflow on the entire document
+   * 3. Access internals via any reachable HA API
+   * 4. Force this card to re-render
    */
-  private _triggerSectionsRecalculate(): void {
-    const sectionsView = this._findSectionsView();
-    
-    if (sectionsView) {
-      // Force the sections view to remeasure and relayout by toggling
-      // a CSS property that affects grid behavior
-      const originalGap = sectionsView.style.gap || 
-                          getComputedStyle(sectionsView).gap;
-      
-      if (originalGap) {
-        // Toggle grid gap to force grid recalculation
-        const gapValue = parseFloat(originalGap);
-        sectionsView.style.gap = (gapValue + 0.1) + 'px';
-        void sectionsView.offsetHeight; // Force sync reflow
-        sectionsView.style.gap = originalGap;
-      } else {
-        // Fallback: toggle visibility to force reflow
-        const originalVisibility = sectionsView.style.visibility;
-        sectionsView.style.visibility = 'hidden';
-        void sectionsView.offsetHeight;
-        sectionsView.style.visibility = originalVisibility;
-      }
-
-      // Force reflow again after restore
-      void sectionsView.offsetHeight;
-      void sectionsView.getBoundingClientRect();
-    }
-
-    // Dispatch resize - HA's frontend listens for this
+  private _forceGlobalRelayout(): void {
+    // Method 1: Dispatch resize event - HA listens for these
     window.dispatchEvent(new Event('resize'));
 
-    // Force re-render of this card
+    // Method 2: Force reflow at the document level by toggling a layout property
+    // This forces the browser to recalculate CSS Grid for all elements
+    const html = document.documentElement;
+    const origOverflow = html.style.overflow || getComputedStyle(html).overflow;
+    html.style.overflow = 'hidden';
+    void html.offsetHeight;
+    html.style.overflow = origOverflow;
+
+    // Method 3: Try to access HA internals via the global customCards registry
+    // and any reachable API on the home-assistant element
+    const haEl = document.querySelector('home-assistant') as HTMLElement | null;
+    if (haEl) {
+      // Force reflow on the home-assistant element
+      void haEl.offsetHeight;
+      void haEl.getBoundingClientRect();
+
+      // Try to call any resize/layout method exposed on the element
+      if (typeof (haEl as any).notifyResize === 'function') {
+        (haEl as any).notifyResize();
+      }
+      
+      // Dispatch resize event into the shadow DOM
+      if (haEl.shadowRoot) {
+        haEl.shadowRoot.dispatchEvent(new Event('resize', { bubbles: true, composed: true }));
+      }
+    }
+
+    // Method 4: Force reflow and re-render of this card
     void this.offsetHeight;
     void this.getBoundingClientRect();
     this.requestUpdate();
 
-    // Additional resize after a short delay for any async layout
-    setTimeout(() => {
+    // Method 5: Additional animations to force visual update
+    requestAnimationFrame(() => {
       window.dispatchEvent(new Event('resize'));
-      void this.offsetHeight;
-      this.requestUpdate();
-    }, 100);
+      
+      requestAnimationFrame(() => {
+        void this.offsetHeight;
+        this.requestUpdate();
+      });
+    });
+
+    // Method 6: Try to access sections view through shadow DOM traversal
+    // Even though it's in shadow DOM, we can traverse into it
+    this._traverseShadowAndTriggerResize(document.body);
   }
 
   /**
-   * Finds the sections view element (hui-sections-view)
+   * Recursively traverses shadow DOM and dispatches resize events
+   * to ensure all components get the notification
    */
-  private _findSectionsView(): HTMLElement | null {
-    // Direct selector for sections view
-    let el: HTMLElement | null = document.querySelector('hui-sections-view');
-    if (el) return el;
+  private _traverseShadowAndTriggerResize(root: HTMLElement | ShadowRoot): void {
+    // Dispatch resize to this root
+    root.dispatchEvent(new Event('resize', { bubbles: true, composed: true }));
 
-    // Try shadow DOM of home-assistant
-    const haEl = document.querySelector('home-assistant');
-    if (haEl?.shadowRoot) {
-      el = haEl.shadowRoot.querySelector('hui-sections-view');
-      if (el) return el;
+    // Force reflow on any matching custom elements
+    const allElements = root.querySelectorAll('*');
+    for (const el of allElements) {
+      const htmlEl = el as HTMLElement;
+      const tagName = htmlEl.tagName.toLowerCase();
+      // Force reflow on sections view and related elements
+      if (
+        tagName === 'hui-sections-view' ||
+        tagName === 'hui-view' ||
+        tagName === 'hui-root-view' ||
+        tagName === 'ha-panel-lovelace'
+      ) {
+        void htmlEl.offsetHeight;
+        void htmlEl.getBoundingClientRect();
 
-      // Dig deeper into nested shadow DOM
-      const allElements = haEl.shadowRoot.querySelectorAll('*');
-      for (const element of allElements) {
-        if ((element as HTMLElement).shadowRoot) {
-          el = (element as HTMLElement).shadowRoot!.querySelector('hui-sections-view');
-          if (el) return el;
+        // Notify any custom element API
+        if (typeof (htmlEl as any).notifyResize === 'function') {
+          (htmlEl as any).notifyResize();
         }
       }
+
+      // Recurse into shadow roots
+      if (htmlEl.shadowRoot) {
+        this._traverseShadowAndTriggerResize(htmlEl.shadowRoot);
+      }
     }
-
-    // Fallback: try panel or view
-    el = document.querySelector('hui-panel-view');
-    if (el) return el;
-    
-    el = document.querySelector('hui-view');
-    if (el) return el;
-
-    return null;
   }
 
   private _startDateTimeUpdate(): void {
@@ -273,7 +254,7 @@ export class HassLayoutCard extends LitElement {
     }
   }
 
-  private _teardownScrollFix(): void {
+  private _teardownViewportFix(): void {
     if (this._recoveryTimer) {
       clearTimeout(this._recoveryTimer);
     }
