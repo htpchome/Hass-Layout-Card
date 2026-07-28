@@ -2,7 +2,7 @@
  * Constants for Hass Layout Card
  */
 
-export const CARD_VERSION = '1.0.0';
+export const CARD_VERSION = '1.0.1';
 export const CARD_TAG_NAME = 'hass-layout-card';
 export const EDITOR_TAG_NAME = 'hass-layout-card-editor';
 
