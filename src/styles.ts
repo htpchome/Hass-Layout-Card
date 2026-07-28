@@ -6,24 +6,6 @@ import { css } from 'lit';
 export const cardStyles = css`
   :host {
     display: block;
-    /* 
-     * CSS Containment: Isolate this component's layout calculations
-     * This prevents layout shifts in parent elements (like iOS pull-to-refresh)
-     * from causing cascading reflow issues in this card
-     */
-    contain: layout style;
-    /* 
-     * will-change hints the browser to optimize for transform changes
-     * This helps with smooth repositioning after viewport shifts
-     */
-    will-change: transform;
-    /* 
-     * transform: translateZ(0) creates a new compositing layer
-     * This isolates the card's rendering from parent layout changes
-     */
-    transform: translateZ(0);
-    /* Ensure proper positioning context */
-    position: relative;
   }
 
   ha-card {
@@ -34,11 +16,6 @@ export const cardStyles = css`
     background: var(--card-background-color, #fff);
     border-radius: var(--ha-card-border-radius, 12px);
     box-shadow: var(--ha-card-box-shadow, 0 2px 6px rgba(0, 0, 0, 0.1));
-    /* Contain layout calculations within the card */
-    contain: content;
-    /* Create compositing layer for smoother rendering */
-    transform: translateZ(0);
-    backface-visibility: hidden;
   }
 
   .card-header {

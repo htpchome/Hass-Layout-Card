@@ -16,64 +16,39 @@ export class HassLayoutCard extends LitElement {
   @state() private _currentDateTime = new Date();
   private _dateTimeInterval?: ReturnType<typeof setInterval>;
   private _hass?: HomeAssistant;
-  private _resizeObserver?: ResizeObserver;
-  private _mutationObserver?: MutationObserver;
   private _scrollHandler?: () => void;
-  private _visibilityHandler?: () => void;
-  private _touchStartHandler?: (e: TouchEvent) => void;
-  private _touchEndHandler?: (e: TouchEvent) => void;
-  private _lastKnownScrollY = 0;
-  private _lastHeaderTop = 0;
-  private _headerCheckInterval?: ReturnType<typeof setInterval>;
-  private _isPulling = false;
-  private _pullStartY = 0;
+  private _touchStartY = 0;
+  private _touchActive = false;
+  private _wasAtTop = false;
+  private _recoveryTimer?: ReturnType<typeof setTimeout>;
 
   static get styles(): CSSResultGroup {
     return cardStyles;
   }
 
-  /**
-   * Returns the configuration element for the card editor
-   */
   static getConfigElement(): HTMLElement {
     return document.createElement('hass-layout-card-editor');
   }
 
-  /**
-   * Returns default configuration for the card
-   */
   static getStubConfig(): HassLayoutCardConfig {
     return { ...DEFAULT_CONFIG };
   }
 
-  /**
-   * Sets the Home Assistant state object
-   */
   public set hass(hass: HomeAssistant) {
     this._hass = hass;
   }
 
-  /**
-   * Gets the Home Assistant state object
-   */
   public get hass(): HomeAssistant | undefined {
     return this._hass;
   }
 
-  /**
-   * Validates and stores the user configuration
-   */
   public setConfig(config: HassLayoutCardConfig): void {
     if (!config) {
       throw new Error('Invalid configuration');
     }
-
     this._config = { ...DEFAULT_CONFIG, ...config };
   }
 
-  /**
-   * Returns the card size for layout calculations
-   */
   public getCardSize(): number {
     return 3;
   }
@@ -81,315 +56,161 @@ export class HassLayoutCard extends LitElement {
   connectedCallback(): void {
     super.connectedCallback();
     this._startDateTimeUpdate();
-    this._setupLayoutObservers();
+    this._setupScrollFix();
   }
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
     this._stopDateTimeUpdate();
-    this._teardownLayoutObservers();
+    this._teardownScrollFix();
   }
 
-  /**
-   * Sets up observers to handle layout changes from iOS pull-to-refresh
-   * and other viewport shifts that can cause card positioning issues
-   */
-  private _setupLayoutObservers(): void {
-    // ResizeObserver to detect container size changes
-    this._resizeObserver = new ResizeObserver(() => {
-      this._handleLayoutShift();
-    });
-    
-    // Observe the parent container (the Lovelace view container)
-    const parentContainer = this._getLovelaceContainer();
-    if (parentContainer) {
-      this._resizeObserver.observe(parentContainer);
-    }
-    // Also observe self for size changes
-    this._resizeObserver.observe(this);
-
-    // Set up MutationObserver to watch the HA header for position changes
-    this._setupHeaderObserver();
-
-    // Scroll handler to detect pull-to-refresh behavior
+  private _setupScrollFix(): void {
     this._scrollHandler = () => {
-      const currentScrollY = window.scrollY || document.documentElement.scrollTop;
+      const scrollY = window.scrollY || document.documentElement.scrollTop;
       
-      // Detect potential pull-to-refresh: scroll goes negative or sudden jump
-      if (currentScrollY < 0 || (this._lastKnownScrollY > 50 && currentScrollY < 10)) {
-        this._startHeaderPolling();
+      if (scrollY <= 0) {
+        this._wasAtTop = true;
       }
       
-      this._lastKnownScrollY = currentScrollY;
+      if (scrollY === 0 && this._wasAtTop) {
+        this._wasAtTop = false;
+        this._scheduleLayoutRecovery();
+      }
     };
     window.addEventListener('scroll', this._scrollHandler, { passive: true });
 
-    // Touch handlers to detect pull-to-refresh gesture
-    this._touchStartHandler = (e: TouchEvent) => {
+    const touchStart = (e: TouchEvent) => {
       if (e.touches.length === 1) {
-        this._pullStartY = e.touches[0].clientY;
-        this._isPulling = true;
+        this._touchStartY = e.touches[0].clientY;
+        this._touchActive = true;
       }
     };
-    
-    this._touchEndHandler = (e: TouchEvent) => {
-      if (this._isPulling) {
-        const pullDistance = e.changedTouches[0].clientY - this._pullStartY;
-        // If pulled down more than 60px, likely a refresh gesture
-        if (pullDistance > 60 && window.scrollY <= 0) {
-          this._startHeaderPolling();
-        }
-        this._isPulling = false;
-      }
-    };
-    
-    window.addEventListener('touchstart', this._touchStartHandler, { passive: true });
-    window.addEventListener('touchend', this._touchEndHandler, { passive: true });
 
-    // Visibility change handler - recalculate when returning to view
-    this._visibilityHandler = () => {
-      if (!document.hidden) {
-        requestAnimationFrame(() => {
-          this._handleLayoutShift();
-        });
+    const touchEnd = (e: TouchEvent) => {
+      if (!this._touchActive) return;
+      this._touchActive = false;
+      const dy = e.changedTouches[0].clientY - this._touchStartY;
+      const scrollY = window.scrollY || document.documentElement.scrollTop;
+      
+      if (dy > 40 && scrollY <= 0) {
+        this._scheduleLayoutRecovery(1500);
       }
     };
-    document.addEventListener('visibilitychange', this._visibilityHandler);
 
-    // Store initial positions
-    this._lastKnownScrollY = window.scrollY || document.documentElement.scrollTop;
-    this._lastHeaderTop = this._getHeaderTop();
+    window.addEventListener('touchstart', touchStart, { passive: true });
+    window.addEventListener('touchend', touchEnd, { passive: true });
+
+    this._teardownScrollFix = () => {
+      window.removeEventListener('scroll', this._scrollHandler!);
+      window.removeEventListener('touchstart', touchStart);
+      window.removeEventListener('touchend', touchEnd);
+      if (this._recoveryTimer) {
+        clearTimeout(this._recoveryTimer);
+      }
+    };
+  }
+
+  private _scheduleLayoutRecovery(delay = 500): void {
+    if (this._recoveryTimer) {
+      clearTimeout(this._recoveryTimer);
+    }
+    
+    this._recoveryTimer = setTimeout(() => this._fixCardTransforms(), delay);
+    setTimeout(() => this._fixCardTransforms(), delay + 300);
+    setTimeout(() => this._fixCardTransforms(), delay + 600);
   }
 
   /**
-   * Sets up MutationObserver to watch the HA header element for changes
+   * Fixes stale CSS transforms on Lovelace cards caused by iOS pull-to-refresh.
+   * 
+   * Lovelace uses transform: translate(x, y) on card containers to position
+   * them in the masonry layout. After iOS pull-to-refresh pushes content down
+   * and then back up, these transforms are stale and cause empty space above
+   * the cards. We fix this by temporarily clearing all transforms, which
+   * triggers the masonry layout to recalculate correct positions.
    */
-  private _setupHeaderObserver(): void {
-    const header = this._getHAHeader();
-    if (!header) {
-      // Retry after a short delay if header not found yet
-      setTimeout(() => this._setupHeaderObserver(), 500);
+  private _fixCardTransforms(): void {
+    const masonryView = this._findMasonryView();
+    if (!masonryView) return;
+
+    // Find all elements with transform:translate that are card containers
+    // These are typically divs inside the masonry view
+    const allElements = masonryView.querySelectorAll<HTMLElement>('*');
+    const transformedElements: Array<{ el: HTMLElement; transform: string }> = [];
+    
+    for (const el of allElements) {
+      const transform = el.style.transform;
+      if (transform && transform.includes('translate')) {
+        transformedElements.push({ el, transform });
+      }
+    }
+
+    if (transformedElements.length === 0) {
+      // No transforms to fix, try resize event instead
+      this._triggerResize();
       return;
     }
 
-    this._mutationObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        if (mutation.type === 'attributes') {
-          const currentHeaderTop = this._getHeaderTop();
-          // If header position changed significantly, handle the shift
-          if (Math.abs(currentHeaderTop - this._lastHeaderTop) > 5) {
-            this._lastHeaderTop = currentHeaderTop;
-            this._handleLayoutShift();
-          }
-        }
-      }
-    });
-
-    // Watch for style and class changes on the header
-    this._mutationObserver.observe(header, {
-      attributes: true,
-      attributeFilter: ['style', 'class', 'hidden', 'aria-hidden'],
-    });
-
-    // Also watch the header's parent for transform changes
-    const headerParent = header.parentElement;
-    if (headerParent) {
-      this._mutationObserver.observe(headerParent, {
-        attributes: true,
-        attributeFilter: ['style', 'class'],
-      });
+    // Step 1: Save and clear all transforms simultaneously
+    for (const { el } of transformedElements) {
+      el.style.transform = '';
     }
 
-    this._lastHeaderTop = this._getHeaderTop();
+    // Step 2: Force a synchronous reflow so browser sees elements without transforms
+    void masonryView.offsetHeight;
+
+    // Step 3: Restore transforms on next frame so masonry layout recalculates them
+    requestAnimationFrame(() => {
+      for (const { el, transform } of transformedElements) {
+        el.style.transform = transform;
+      }
+
+      // Step 4: After restore, trigger another reflow and resize event
+      requestAnimationFrame(() => {
+        void masonryView.offsetHeight;
+        this._triggerResize();
+      });
+    });
   }
 
   /**
-   * Gets the Home Assistant header element
+   * Triggers resize events to force Lovelace to recalculate layout
    */
-  private _getHAHeader(): HTMLElement | null {
-    // Try various selectors for the HA header
+  private _triggerResize(): void {
+    window.dispatchEvent(new Event('resize'));
+    
+    // Also force re-render of this card
+    void this.offsetHeight;
+    void this.getBoundingClientRect();
+    this.requestUpdate();
+  }
+
+  /**
+   * Finds the masonry/grid view element that manages card layout
+   */
+  private _findMasonryView(): HTMLElement | null {
     const selectors = [
-      'app-header',
-      'ha-app-layout app-header',
-      '.header',
-      'app-toolbar',
-      'ha-menu-button',
+      'hui-masonry-view',
+      'hui-panel-view',
+      'hui-view',
+      'hui-sections-view',
     ];
     
-    // Search in the shadow DOM host or document
-    const root = this.getRootNode() as Document | ShadowRoot;
-    
     for (const selector of selectors) {
-      const element = root.querySelector(selector) || document.querySelector(selector);
-      if (element) {
-        return element as HTMLElement;
-      }
+      const el = document.querySelector(selector);
+      if (el) return el as HTMLElement;
     }
     
-    // Try to find via home-assistant element
-    const haMain = document.querySelector('home-assistant')?.shadowRoot?.querySelector('ha-panel-lovelace');
-    if (haMain) {
-      const header = haMain.shadowRoot?.querySelector('app-header') || 
-                     haMain.shadowRoot?.querySelector('hui-view')?.shadowRoot?.querySelector('app-header');
-      if (header) {
-        return header as HTMLElement;
+    const haEl = document.querySelector('home-assistant');
+    if (haEl?.shadowRoot) {
+      for (const selector of selectors) {
+        const el = haEl.shadowRoot.querySelector(selector);
+        if (el) return el as HTMLElement;
       }
     }
     
     return null;
-  }
-
-  /**
-   * Gets the current top position of the HA header
-   */
-  private _getHeaderTop(): number {
-    const header = this._getHAHeader();
-    if (header) {
-      const rect = header.getBoundingClientRect();
-      return rect.top;
-    }
-    return 0;
-  }
-
-  /**
-   * Starts polling to detect when header returns to normal position after refresh
-   */
-  private _startHeaderPolling(): void {
-    if (this._headerCheckInterval) {
-      return; // Already polling
-    }
-
-    let pollCount = 0;
-    const maxPolls = 50; // Poll for ~2.5 seconds max
-
-    this._headerCheckInterval = setInterval(() => {
-      pollCount++;
-      const currentHeaderTop = this._getHeaderTop();
-      
-      // Check if header has moved back up (refresh completed)
-      if (Math.abs(currentHeaderTop - this._lastHeaderTop) > 5) {
-        this._lastHeaderTop = currentHeaderTop;
-        this._handleLayoutShift();
-      }
-
-      // Stop polling after max polls or if we've been stable for a while
-      if (pollCount >= maxPolls) {
-        this._stopHeaderPolling();
-      }
-    }, 50);
-
-    // Auto-stop after 3 seconds
-    setTimeout(() => this._stopHeaderPolling(), 3000);
-  }
-
-  /**
-   * Stops header position polling
-   */
-  private _stopHeaderPolling(): void {
-    if (this._headerCheckInterval) {
-      clearInterval(this._headerCheckInterval);
-      this._headerCheckInterval = undefined;
-    }
-  }
-
-  /**
-   * Tears down all observers and event listeners
-   */
-  private _teardownLayoutObservers(): void {
-    this._stopHeaderPolling();
-
-    if (this._resizeObserver) {
-      this._resizeObserver.disconnect();
-      this._resizeObserver = undefined;
-    }
-
-    if (this._mutationObserver) {
-      this._mutationObserver.disconnect();
-      this._mutationObserver = undefined;
-    }
-
-    if (this._scrollHandler) {
-      window.removeEventListener('scroll', this._scrollHandler);
-      this._scrollHandler = undefined;
-    }
-
-    if (this._touchStartHandler) {
-      window.removeEventListener('touchstart', this._touchStartHandler);
-      this._touchStartHandler = undefined;
-    }
-
-    if (this._touchEndHandler) {
-      window.removeEventListener('touchend', this._touchEndHandler);
-      this._touchEndHandler = undefined;
-    }
-
-    if (this._visibilityHandler) {
-      document.removeEventListener('visibilitychange', this._visibilityHandler);
-      this._visibilityHandler = undefined;
-    }
-  }
-
-  /**
-   * Gets the Lovelace view container element
-   */
-  private _getLovelaceContainer(): HTMLElement | null {
-    // Walk up the DOM to find the Lovelace container
-    let element: HTMLElement | null = this.parentElement;
-    while (element) {
-      // Look for common HA container selectors
-      if (
-        element.classList.contains('column') ||
-        element.id === 'columns' ||
-        element.tagName.toLowerCase() === 'hui-view' ||
-        element.tagName.toLowerCase() === 'hui-panel-view'
-      ) {
-        return element;
-      }
-      element = element.parentElement;
-    }
-    return null;
-  }
-
-  /**
-   * Handles layout shifts by forcing a re-render and position recalculation
-   * This is the key fix for iOS pull-to-refresh positioning issues
-   */
-  private _handleLayoutShift(): void {
-    // Force the browser to recalculate layout
-    void this.offsetHeight;
-    
-    // Request a re-render of the component
-    this.requestUpdate();
-    
-    // Use multiple animation frames to ensure layout is fully recalculated
-    requestAnimationFrame(() => {
-      // Force reflow by reading layout properties
-      void this.getBoundingClientRect();
-      
-      requestAnimationFrame(() => {
-        // Force another layout calculation
-        void this.offsetHeight;
-        void this.getBoundingClientRect();
-        
-        // Try to scroll to ensure proper positioning
-        const cardRect = this.getBoundingClientRect();
-        const headerTop = this._getHeaderTop();
-        
-        // If card appears to be overlapping with header area, force adjustment
-        if (cardRect.top < headerTop + 50 && headerTop > 0) {
-          // Dispatch scroll event to trigger HA's layout recalculation
-          window.dispatchEvent(new Event('resize'));
-          window.dispatchEvent(new Event('scroll'));
-        }
-        
-        // Dispatch a custom event that other cards can listen to
-        this.dispatchEvent(new CustomEvent('layout-shift-handled', {
-          bubbles: true,
-          composed: true,
-          detail: { headerTop, cardTop: cardRect.top }
-        }));
-      });
-    });
   }
 
   private _startDateTimeUpdate(): void {
@@ -403,6 +224,12 @@ export class HassLayoutCard extends LitElement {
     if (this._dateTimeInterval) {
       clearInterval(this._dateTimeInterval);
       this._dateTimeInterval = undefined;
+    }
+  }
+
+  private _teardownScrollFix(): void {
+    if (this._recoveryTimer) {
+      clearTimeout(this._recoveryTimer);
     }
   }
 
@@ -476,7 +303,6 @@ export class HassLayoutCard extends LitElement {
   }
 }
 
-// Register the card with Home Assistant
 declare global {
   interface HTMLElementTagNameMap {
     [CARD_TAG_NAME]: HassLayoutCard;
@@ -492,7 +318,6 @@ declare global {
   }
 }
 
-// Add card to custom cards registry
 window.customCards = window.customCards || [];
 window.customCards.push({
   type: CARD_TAG_NAME,
@@ -501,7 +326,6 @@ window.customCards.push({
   preview: true,
 });
 
-// Log version info
 console.info(
   `%c HASS-LAYOUT-CARD %c v${CARD_VERSION} `,
   'color: white; background: #03a9f4; font-weight: bold;',
